@@ -1,23 +1,19 @@
-use std::fmt;
-
 use iced::widget::{column, row, rule, text};
 use iced::{Element, Length, Theme};
 use shadcn_iced::tokens;
+use std::fmt;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Choice<T> {
     pub value: T,
     pub label: String,
 }
-
 impl<T: PartialEq> PartialEq for Choice<T> {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
     }
 }
-
 impl<T: Eq> Eq for Choice<T> {}
-
 impl<T> Choice<T> {
     pub fn new(value: T, label: impl Into<String>) -> Self {
         Self {
@@ -26,10 +22,9 @@ impl<T> Choice<T> {
         }
     }
 }
-
 impl<T> fmt::Display for Choice<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.label)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
     }
 }
 
@@ -38,32 +33,30 @@ pub(crate) fn section<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     column![
-        row![text(title).size(22), rule::horizontal(1)]
-            .spacing(12)
+        row![text(title).size(16), rule::horizontal(1)]
+            .spacing(10)
             .align_y(iced::Center),
-        content.into(),
+        content.into()
     ]
-    .spacing(14)
+    .spacing(8)
     .width(Length::Fill)
     .into()
 }
-
 pub(crate) fn field<'a, Message: 'a>(
     label: &'a str,
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    column![text(label).size(14), control.into()]
-        .spacing(7)
+    column![text(label).size(12), control.into()]
+        .spacing(4)
         .width(Length::Fill)
         .into()
 }
-
 pub(crate) fn note<'a, Message: 'a>(
     content: impl Into<String>,
     theme: &Theme,
 ) -> Element<'a, Message> {
     text(content.into())
-        .size(12)
+        .size(11)
         .color(tokens(theme).palette.muted_foreground)
         .into()
 }

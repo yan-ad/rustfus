@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/rustfus-core", "crates/rustfus-etc"]
+exclude = ["vendor/cosmic-text"]
 default-members = ["crates/rustfus-etc"]
 resolver = "3"
 
@@ -15,6 +16,9 @@ iced = { version = "=0.14.0", default-features = false, features = ["wgpu", "tin
 shadcn-iced = { version = "=0.3.0", default-features = false, features = ["lucide"] }
 rfd = "0.17"
 tempfile = "3"
+
+[patch.crates-io]
+cosmic-text = { path = "vendor/cosmic-text" }
 
 [profile.release]
 codegen-units = 1

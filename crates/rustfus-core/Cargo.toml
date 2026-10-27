@@ -6,12 +6,23 @@ rust-version.workspace = true
 license.workspace = true
 description = "GUI-independent USB discovery and media configuration for RustFus"
 
+[dependencies]
+fatfs = "=0.3.6"
+crc32fast = "1"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+isomage = "=2.1.0"
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 io-kit-sys = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO", "Win32_Security", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 tempfile.workspace = true

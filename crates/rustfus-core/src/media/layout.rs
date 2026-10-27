@@ -18,11 +18,15 @@ pub struct Layout {
 
 impl Layout {
     pub fn start_bytes(&self) -> Result<u64, String> {
-        self.start_lba.checked_mul(u64::from(self.sector_size)).ok_or_else(|| "Partition offset overflow".into())
+        self.start_lba
+            .checked_mul(u64::from(self.sector_size))
+            .ok_or_else(|| "Partition offset overflow".into())
     }
 
     pub fn length_bytes(&self) -> Result<u64, String> {
-        self.sectors.checked_mul(u64::from(self.sector_size)).ok_or_else(|| "Partition length overflow".into())
+        self.sectors
+            .checked_mul(u64::from(self.sector_size))
+            .ok_or_else(|| "Partition length overflow".into())
     }
 }
 
@@ -47,9 +51,15 @@ pub fn plan(total_bytes: u64, sector_size: u32, scheme: LayoutScheme) -> Result<
         }
         LayoutScheme::Gpt => 1 + GPT_ENTRIES_BYTES.div_ceil(ss),
     };
-    let sectors = total_sectors.checked_sub(start_lba + reserve).filter(|n| *n > 0)
+    let sectors = total_sectors
+        .checked_sub(start_lba + reserve)
+        .filter(|n| *n > 0)
         .ok_or("Disk is too small for an aligned partition")?;
-    Ok(Layout { start_lba, sectors, sector_size })
+    Ok(Layout {
+        start_lba,
+        sectors,
+        sector_size,
+    })
 }
 
 /// Erases the first and last MiB, then writes a single partition table.
@@ -61,6 +71,18 @@ pub fn write_partition_table<W: Read + Write + Seek>(
     total_bytes: u64,
     layout: &Layout,
     scheme: LayoutScheme,
+) -> Result<(), String> {
+    write_partition_table_with_efi(disk, total_bytes, layout, scheme, false)
+}
+
+/// GPT uses EFI System Partition type when requested; MBR remains inactive FAT32
+/// LBA (0x0c). No BIOS loader is installed.
+pub fn write_partition_table_with_efi<W: Read + Write + Seek>(
+    disk: &mut W,
+    total_bytes: u64,
+    layout: &Layout,
+    scheme: LayoutScheme,
+    efi: bool,
 ) -> Result<(), String> {
     if *layout != plan(total_bytes, layout.sector_size, scheme)? {
         return Err("Layout does not match the disk size and partition scheme".into());
@@ -82,7 +104,11 @@ pub fn write_partition_table<W: Read + Write + Seek>(
         entry[5..8].copy_from_slice(&[0xfe, 0xff, 0xff]);
         let (kind, start, count) = match scheme {
             LayoutScheme::Mbr => (0x0c, layout.start_lba as u32, layout.sectors as u32),
-            LayoutScheme::Gpt => (0xee, 1, (total_bytes / u64::from(layout.sector_size) - 1).min(u64::from(u32::MAX)) as u32),
+            LayoutScheme::Gpt => (
+                0xee,
+                1,
+                (total_bytes / u64::from(layout.sector_size) - 1).min(u64::from(u32::MAX)) as u32,
+            ),
         };
         entry[4] = kind;
         entry[8..12].copy_from_slice(&start.to_le_bytes());
@@ -95,7 +121,15 @@ pub fn write_partition_table<W: Read + Write + Seek>(
             let entry_sectors = GPT_ENTRIES_BYTES.div_ceil(ss);
             let mut entries = vec![0u8; GPT_ENTRIES_BYTES as usize];
             // Microsoft basic data GUID, in GPT mixed-endian wire order.
-            entries[..16].copy_from_slice(&[0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7]);
+            entries[..16].copy_from_slice(&[
+                0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26,
+                0x99, 0xc7,
+            ]);
+            if efi {
+                entries[..16].copy_from_slice(
+                    &uuid::Uuid::from_u128(0xc12a7328_f81f_11d2_ba4b_00a0c93ec93b).to_bytes_le(),
+                );
+            }
             entries[16..32].copy_from_slice(&partition_guid.to_bytes_le());
             entries[32..40].copy_from_slice(&layout.start_lba.to_le_bytes());
             entries[40..48].copy_from_slice(&(layout.start_lba + layout.sectors - 1).to_le_bytes());
@@ -123,7 +157,11 @@ pub fn write_partition_table<W: Read + Write + Seek>(
             };
             write_at(disk, 2 * ss, &entries)?;
             write_at(disk, (last_lba - entry_sectors) * ss, &entries)?;
-            write_at(disk, last_lba * ss, &header(last_lba, 1, last_lba - entry_sectors))?;
+            write_at(
+                disk,
+                last_lba * ss,
+                &header(last_lba, 1, last_lba - entry_sectors),
+            )?;
             write_at(disk, ss, &header(1, last_lba, 2))?;
         }
         disk.flush()
@@ -152,16 +190,62 @@ fn zero_range<W: Write + Seek>(disk: &mut W, start: u64, length: u64) -> std::io
 mod tests {
     use super::*;
 
-    fn u32_at(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) }
-    fn u64_at(bytes: &[u8], at: usize) -> u64 { u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) }
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+    fn u64_at(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
     // Bitwise reference implementation, independent of the production CRC library.
     fn crc(bytes: &[u8]) -> u32 {
         let mut n = !0u32;
         for b in bytes {
             n ^= u32::from(*b);
-            for _ in 0..8 { n = (n >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(n & 1)); }
+            for _ in 0..8 {
+                n = (n >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(n & 1));
+            }
         }
         !n
+    }
+
+    #[test]
+    fn efi_partition_types_and_backup_entries() {
+        for ss in [512, 4096] {
+            for efi in [false, true] {
+                for scheme in [LayoutScheme::Mbr, LayoutScheme::Gpt] {
+                    let size = 2 * MIB;
+                    let p = plan(size, ss, scheme).unwrap();
+                    let mut disk = std::io::Cursor::new(vec![0xaa; size as usize]);
+                    write_partition_table_with_efi(&mut disk, size, &p, scheme, efi).unwrap();
+                    let bytes = disk.get_ref();
+                    assert_eq!(bytes[446], 0);
+                    assert!(bytes[..440].iter().all(|b| *b == 0));
+                    if scheme == LayoutScheme::Gpt {
+                        let expected = if efi {
+                            "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+                        } else {
+                            "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
+                        };
+                        for header in [ss as usize, size as usize - ss as usize] {
+                            let entries = u64_at(bytes, header + 72) as usize * ss as usize;
+                            assert_eq!(
+                                uuid::Uuid::from_bytes_le(
+                                    bytes[entries..entries + 16].try_into().unwrap()
+                                )
+                                .to_string(),
+                                expected
+                            );
+                            assert_eq!(
+                                crc(&bytes[entries..entries + GPT_ENTRIES_BYTES as usize]),
+                                u32_at(bytes, header + 88)
+                            );
+                        }
+                    } else {
+                        assert_eq!(bytes[450], 0x0c);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -196,7 +280,14 @@ mod tests {
                 image.seek(SeekFrom::Start(0)).unwrap();
                 image.read_exact(&mut mbr).unwrap();
                 assert_eq!(&mbr[510..], &[0x55, 0xaa]);
-                assert_eq!(mbr[450], if scheme == LayoutScheme::Mbr { 0x0c } else { 0xee });
+                assert_eq!(
+                    mbr[450],
+                    if scheme == LayoutScheme::Mbr {
+                        0x0c
+                    } else {
+                        0xee
+                    }
+                );
                 if scheme == LayoutScheme::Mbr {
                     assert_eq!(u32_at(&mbr, 454) as u64, p.start_lba);
                     assert_eq!(u32_at(&mbr, 458) as u64, p.sectors);
@@ -206,7 +297,9 @@ mod tests {
                     let last = size / u64::from(ss) - 1;
                     let mut copies = Vec::new();
                     for (current, backup) in [(1, last), (last, 1)] {
-                        image.seek(SeekFrom::Start(current * u64::from(ss))).unwrap();
+                        image
+                            .seek(SeekFrom::Start(current * u64::from(ss)))
+                            .unwrap();
                         let mut h = vec![0; ss as usize];
                         image.read_exact(&mut h).unwrap();
                         assert_eq!(&h[..8], b"EFI PART");
@@ -216,7 +309,9 @@ mod tests {
                         h[16..20].fill(0);
                         assert_eq!(crc(&h[..92]), expected_crc);
                         let mut entries = vec![0; GPT_ENTRIES_BYTES as usize];
-                        image.seek(SeekFrom::Start(u64_at(&h, 72) * u64::from(ss))).unwrap();
+                        image
+                            .seek(SeekFrom::Start(u64_at(&h, 72) * u64::from(ss)))
+                            .unwrap();
                         image.read_exact(&mut entries).unwrap();
                         assert_eq!(crc(&entries), u32_at(&h, 88));
                         assert_eq!(u64_at(&entries, 32), p.start_lba);

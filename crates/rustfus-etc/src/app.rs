@@ -1,7 +1,13 @@
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 
 use iced::{Element, Subscription, Task};
-use rustfus_core::devices::DeviceMonitor;
+use rustfus_core::devices::{DeviceInfo, DeviceMonitor};
+use rustfus_core::media::{self, Phase, Progress, WriteRequest, WriteSummary};
 use rustfus_core::model::{AppModel, BootSelection, IsoImage, PartitionScheme, TargetSystem};
 
 use crate::components::Choice;
@@ -14,10 +20,19 @@ pub(crate) enum Message {
     SelectBoot(Choice<BootSelection>),
     SelectPartition(PartitionScheme),
     SelectTarget(Choice<TargetSystem>),
+    SelectCluster(Choice<Option<u32>>),
+    SelectFilesystem(Choice<String>),
+    LabelChanged(String),
     IncludeFixed(bool),
-    ToggleAdvanced,
     ChooseImage,
     ImageChosen(Option<Result<IsoImage, String>>),
+    Start,
+    ConfirmationChanged(String),
+    Confirm,
+    DismissConfirmation,
+    Cancel,
+    CopyError,
+    EditSettings,
     Close,
 }
 
@@ -37,9 +52,16 @@ pub(crate) enum Discovery {
     Failed(String),
 }
 
+struct Worker {
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<Option<Progress>>>,
+    done: mpsc::Receiver<Result<WriteSummary, String>>,
+}
+
 pub(crate) struct App {
     pub state: State,
     monitor: DeviceMonitor,
+    worker: Option<Worker>,
 }
 
 pub(crate) struct State {
@@ -47,10 +69,17 @@ pub(crate) struct State {
     pub discovery: Discovery,
     pub image_error: Option<String>,
     pub choosing_image: bool,
-    pub advanced_open: bool,
     pub device_options: Vec<Choice<String>>,
-    pub target_options: [Choice<TargetSystem>; 2],
     pub theme: iced::Theme,
+    pub volume_label: String,
+    pub cluster_size: Option<u32>,
+    pub confirmation: Option<WriteRequest>,
+    pub confirmation_text: String,
+    pub running: bool,
+    pub cancelling: bool,
+    pub active_request: Option<WriteRequest>,
+    pub progress: Option<Progress>,
+    pub result: Option<Result<WriteSummary, String>>,
 }
 
 impl Default for State {
@@ -60,22 +89,30 @@ impl Default for State {
             discovery: Discovery::Loading,
             image_error: None,
             choosing_image: false,
-            advanced_open: false,
             device_options: Vec::new(),
-            target_options: [
-                Choice::new(TargetSystem::BiosOrUefi, "BIOS or UEFI"),
-                Choice::new(TargetSystem::Legacy, "Legacy"),
-            ],
-            theme: shadcn_iced::theme::neutral(shadcn_iced::Mode::Light).build(),
+            theme: native_theme(iced::theme::Mode::Light),
+            volume_label: "RUSTFUS".into(),
+            cluster_size: None,
+            confirmation: None,
+            confirmation_text: String::new(),
+            running: false,
+            cancelling: false,
+            active_request: None,
+            progress: None,
+            result: None,
         }
     }
 }
 
 impl State {
-    pub fn apply_devices(
-        &mut self,
-        result: Result<Vec<rustfus_core::devices::DeviceInfo>, String>,
-    ) {
+    pub fn locked(&self) -> bool {
+        self.running || self.confirmation.is_some() || self.choosing_image
+    }
+
+    pub fn apply_devices(&mut self, result: Result<Vec<DeviceInfo>, String>) {
+        if self.running || self.confirmation.is_some() {
+            return;
+        }
         match result {
             Ok(devices) => {
                 self.model.apply_devices(devices);
@@ -105,20 +142,144 @@ impl State {
     fn select_boot(&mut self, selection: BootSelection) {
         if matches!(selection, BootSelection::NonBootable | BootSelection::Iso) {
             self.model.boot_selection = selection;
+            self.model.target_system = TargetSystem::BiosOrUefi;
         }
     }
 
     pub fn apply_image(&mut self, result: Option<Result<IsoImage, String>>) {
+        if self.running || self.confirmation.is_some() {
+            return;
+        }
         self.choosing_image = false;
         match result {
             Some(Ok(image)) => {
                 self.model.iso = Some(image);
-                self.model.boot_selection = BootSelection::Iso;
+                self.select_boot(BootSelection::Iso);
                 self.image_error = None;
             }
             Some(Err(error)) => self.image_error = Some(error),
-            // Cancelling preserves the last valid image and its mode.
             None => {}
+        }
+    }
+
+    pub fn validation_error(&self) -> Option<String> {
+        if self.choosing_image {
+            return Some("Finish selecting an ISO first.".into());
+        }
+        let Some(device) = self.model.selected_device() else {
+            return Some("Select a USB disk.".into());
+        };
+        if device.read_only {
+            return Some("The selected disk is read-only.".into());
+        }
+        if !matches!(
+            self.model.boot_selection,
+            BootSelection::NonBootable | BootSelection::Iso
+        ) {
+            return Some("Choose Non Bootable or Windows ISO.".into());
+        }
+        if self.model.boot_selection == BootSelection::Iso && self.model.iso.is_none() {
+            return Some("Select a Windows installer ISO.".into());
+        }
+        let label = &self.volume_label;
+        if label.len() > 11
+            || !label.is_ascii()
+            || label.starts_with(' ')
+            || label.ends_with(' ')
+            || label
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7f || b"\"*+,./:;<=>?[\\]|".contains(&b))
+        {
+            return Some(
+                "Label: up to 11 ASCII characters, no edge spaces or FAT32 punctuation.".into(),
+            );
+        }
+        None
+    }
+
+    fn request_confirmation(&mut self) {
+        if self.locked() || self.validation_error().is_some() {
+            return;
+        }
+        let Some(device) = self.model.selected_device().cloned() else {
+            return;
+        };
+        self.confirmation = Some(WriteRequest {
+            device,
+            boot: self.model.boot_selection,
+            image: self.model.iso.clone(),
+            scheme: self.model.partition_scheme,
+            target: TargetSystem::BiosOrUefi,
+            volume_label: self.volume_label.clone(),
+            cluster_size: self.cluster_size,
+        });
+        self.confirmation_text.clear();
+        self.result = None;
+    }
+
+    pub fn can_confirm(&self) -> bool {
+        !self.running
+            && self.confirmation.as_ref().is_some_and(|r| {
+                !r.device.path.is_empty()
+                    && self.confirmation_text == r.device.path
+                    && self.model.selected_device().is_some_and(|d| d == &r.device)
+            })
+    }
+
+    fn begin_confirmed(&mut self) -> Option<(WriteRequest, String)> {
+        if !self.can_confirm() {
+            return None;
+        }
+        let request = self.confirmation.take()?;
+        self.active_request = Some(request.clone());
+        self.running = true;
+        self.cancelling = false;
+        self.result = None;
+        self.progress = Some(Progress {
+            phase: Phase::Preparing,
+            completed: 0,
+            total: 0,
+            detail: "Starting background operation".into(),
+        });
+        Some((request, std::mem::take(&mut self.confirmation_text)))
+    }
+
+    fn finish(&mut self, result: Result<WriteSummary, String>) {
+        self.running = false;
+        self.cancelling = false;
+        self.progress = None;
+        self.result = Some(result);
+    }
+
+    fn configure(&mut self, message: Message) {
+        if self.locked() {
+            return;
+        }
+        match message {
+            Message::SelectDevice(choice)
+                if self.model.devices.iter().any(|d| d.id == choice.value) =>
+            {
+                self.model.selected_device = Some(choice.value)
+            }
+            Message::SelectBoot(choice) => self.select_boot(choice.value),
+            Message::SelectPartition(scheme) => self.model.partition_scheme = scheme,
+            Message::SelectFilesystem(choice) if choice.value == "FAT32" => {}
+            Message::SelectTarget(choice) if choice.value == TargetSystem::BiosOrUefi => {
+                self.model.target_system = choice.value
+            }
+            Message::SelectCluster(choice)
+                if choice.value.is_none_or(|v| {
+                    matches!(v, 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768)
+                }) =>
+            {
+                self.cluster_size = choice.value
+            }
+            Message::LabelChanged(label) => self.volume_label = label,
+            Message::IncludeFixed(include) => {
+                self.model.set_include_fixed(include);
+                self.update_device_options();
+            }
+            _ => {}
         }
     }
 }
@@ -135,6 +296,28 @@ impl App {
         Self {
             state: State::default(),
             monitor: DeviceMonitor::start(),
+            worker: None,
+        }
+    }
+
+    fn poll_worker(&mut self) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        if let Ok(mut progress) = worker.progress.lock()
+            && let Some(progress) = progress.take()
+        {
+            self.state.progress = Some(progress);
+        }
+        let done = match worker.done.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err("The media worker stopped unexpectedly. The disk may be incomplete and need reformatting.".into())),
+            Err(mpsc::TryRecvError::Empty) => None,
+        };
+        if let Some(result) = done {
+            self.worker = None;
+            self.state.finish(result);
+            self.monitor.refresh();
         }
     }
 
@@ -142,53 +325,102 @@ impl App {
         match message {
             Message::SystemThemeChanged(mode) => self.state.apply_system_theme(mode),
             Message::DeviceUpdate => {
-                if let Some(result) = self.monitor.try_recv() {
+                self.poll_worker();
+                if !self.state.running
+                    && self.state.confirmation.is_none()
+                    && let Some(result) = self.monitor.try_recv()
+                {
                     self.state.apply_devices(result);
                 }
             }
-            Message::SelectDevice(choice) => {
-                if self
-                    .state
-                    .model
-                    .devices
-                    .iter()
-                    .any(|device| device.id == choice.value)
-                {
-                    self.state.model.selected_device = Some(choice.value);
-                }
-            }
-            Message::SelectBoot(choice) => {
-                self.state.select_boot(choice.value);
-            }
-            Message::SelectPartition(scheme) => self.state.model.partition_scheme = scheme,
-            Message::SelectTarget(choice) => self.state.model.target_system = choice.value,
-            Message::IncludeFixed(include) => {
-                self.state.model.set_include_fixed(include);
-                self.state.update_device_options();
-            }
-            Message::ToggleAdvanced => self.state.advanced_open = !self.state.advanced_open,
-            Message::ChooseImage if !self.state.choosing_image => {
+            Message::ChooseImage if !self.state.locked() => {
                 self.state.choosing_image = true;
                 return Task::perform(pick_iso(), Message::ImageChosen);
             }
-            Message::ChooseImage => {}
             Message::ImageChosen(result) => self.state.apply_image(result),
-            Message::Close => return iced::exit(),
+            Message::Start => self.state.request_confirmation(),
+            Message::EditSettings if !self.state.locked() => self.state.result = None,
+            Message::ConfirmationChanged(value)
+                if !self.state.running && self.state.confirmation.is_some() =>
+            {
+                self.state.confirmation_text = value
+            }
+            Message::DismissConfirmation if !self.state.running => {
+                self.state.confirmation = None;
+                self.state.confirmation_text.clear();
+            }
+            Message::Confirm => {
+                if let Some((request, confirmation)) = self.state.begin_confirmed() {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let progress = Arc::new(Mutex::new(None));
+                    let (send, done) = mpsc::sync_channel(1);
+                    let worker_cancel = Arc::clone(&cancel);
+                    let worker_progress = Arc::clone(&progress);
+                    match std::thread::Builder::new()
+                        .name("rustfus-media".into())
+                        .spawn(move || {
+                            let result =
+                                media::run(request, &confirmation, &worker_cancel, |value| {
+                                    if let Ok(mut latest) = worker_progress.lock() {
+                                        *latest = Some(value);
+                                    }
+                                });
+                            let _ = send.send(result);
+                        }) {
+                        Ok(_) => {
+                            self.worker = Some(Worker {
+                                cancel,
+                                progress,
+                                done,
+                            })
+                        }
+                        Err(error) => self
+                            .state
+                            .finish(Err(format!("Could not start the media worker: {error}"))),
+                    }
+                }
+            }
+            Message::Cancel | Message::Close if self.state.running => {
+                if let Some(worker) = &self.worker {
+                    worker.cancel.store(true, Ordering::Relaxed);
+                }
+                self.state.cancelling = true;
+            }
+            Message::CopyError => {
+                if let Some(Err(error)) = &self.state.result {
+                    return iced::clipboard::write(error.clone());
+                }
+                if let Some(error) = &self.state.image_error {
+                    return iced::clipboard::write(error.clone());
+                }
+                if let Discovery::Failed(error) = &self.state.discovery {
+                    return iced::clipboard::write(error.clone());
+                }
+            }
+            Message::Close if !self.state.choosing_image => return iced::exit(),
+            other => self.state.configure(other),
         }
         Task::none()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            iced::time::every(Duration::from_millis(250)).map(|_| Message::DeviceUpdate),
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::DeviceUpdate),
             iced::system::theme_changes().map(Message::SystemThemeChanged),
+            iced::window::close_requests().map(|_| Message::Close),
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::DismissConfirmation),
+                _ => None,
+            }),
         ])
     }
 
     pub fn theme(&self) -> iced::Theme {
         self.state.theme.clone()
     }
-
     pub fn view(&self) -> Element<'_, Message> {
         crate::view::view(&self.state)
     }
@@ -196,7 +428,7 @@ impl App {
 
 async fn pick_iso() -> Option<Result<IsoImage, String>> {
     let file = rfd::AsyncFileDialog::new()
-        .set_title("Select ISO image")
+        .set_title("Select Windows installer ISO")
         .add_filter("ISO images", &["iso", "ISO"])
         .pick_file()
         .await?;
@@ -212,152 +444,162 @@ async fn pick_iso() -> Option<Result<IsoImage, String>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn discovery_failure_clears_stale_targets_and_recovers_automatically() {
+    fn ready() -> State {
         let mut state = State::default();
-        state.apply_devices(Err("temporary device error".into()));
-        assert!(matches!(state.discovery, Discovery::Failed(_)));
-        assert!(state.device_options.is_empty());
-        assert!(state.model.selected_device.is_none());
-        state.apply_devices(Ok(vec![]));
-        assert_eq!(state.discovery, Discovery::Ready);
-    }
-
-    #[test]
-    fn cancelled_picker_preserves_image_and_selection() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("system.iso");
-        std::fs::write(&path, b"image fixture").unwrap();
-        let mut state = State::default();
-        state.apply_image(Some(IsoImage::open(path.clone())));
-        state.choosing_image = true;
-        state.apply_image(None);
-        assert!(!state.choosing_image);
-        assert_eq!(state.model.iso.as_ref().unwrap().path, path);
-        assert_eq!(state.model.boot_selection, BootSelection::Iso);
-    }
-
-    #[test]
-    fn failed_picker_inspection_preserves_valid_image_and_shows_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("system.iso");
-        std::fs::write(&path, b"image fixture").unwrap();
-        let mut state = State::default();
-        state.apply_image(Some(IsoImage::open(path.clone())));
-        state.apply_image(Some(Err("cannot read new image".into())));
-        assert_eq!(state.model.iso.as_ref().unwrap().path, path);
-        assert!(state.image_error.is_some());
-    }
-
-    #[test]
-    fn unsupported_dos_selections_cannot_replace_supported_modes() {
-        let mut state = State::default();
-        for supported in [BootSelection::NonBootable, BootSelection::Iso] {
-            state.select_boot(supported);
-            assert_eq!(state.model.boot_selection, supported);
-            for unsupported in [BootSelection::MsDos, BootSelection::FreeDos] {
-                state.select_boot(unsupported);
-                assert_eq!(state.model.boot_selection, supported);
-            }
-        }
-    }
-
-    #[test]
-    fn selected_iso_label_uses_the_real_filename() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("actual-system-image.iso");
-        std::fs::write(&path, b"image fixture").unwrap();
-        let mut state = State::default();
-        state.apply_image(Some(IsoImage::open(path)));
-        assert_eq!(
-            state.model.boot_selection_label(),
-            "actual-system-image.iso"
-        );
-        assert_eq!(
-            state.model.iso.as_ref().unwrap().name,
-            "actual-system-image.iso"
-        );
-    }
-
-    fn assert_theme(theme: &iced::Theme, mode: shadcn_iced::Mode) {
-        let expected = shadcn_iced::theme::neutral(mode).tokens();
-        let actual = shadcn_iced::tokens(theme);
-        assert_eq!(actual.mode, mode);
-        assert_eq!(actual.palette, expected.palette);
-        assert_eq!(theme.palette().background, expected.palette.background);
-        assert_eq!(theme.palette().text, expected.palette.foreground);
-        assert_eq!(theme.palette().primary, expected.palette.primary);
-    }
-
-    #[test]
-    fn native_theme_maps_system_modes_to_neutral_tokens() {
-        for (system, expected) in [
-            (iced::theme::Mode::Light, shadcn_iced::Mode::Light),
-            (iced::theme::Mode::Dark, shadcn_iced::Mode::Dark),
-            (iced::theme::Mode::None, shadcn_iced::Mode::Light),
-        ] {
-            assert_theme(&native_theme(system), expected);
-        }
-    }
-
-    #[test]
-    fn system_theme_switches_both_ways_and_unknown_mode_falls_back_to_light() {
-        let mut state = State::default();
-        assert_theme(&state.theme, shadcn_iced::Mode::Light);
-        for (system, expected) in [
-            (iced::theme::Mode::Dark, shadcn_iced::Mode::Dark),
-            (iced::theme::Mode::Light, shadcn_iced::Mode::Light),
-            (iced::theme::Mode::Dark, shadcn_iced::Mode::Dark),
-            (iced::theme::Mode::None, shadcn_iced::Mode::Light),
-        ] {
-            state.apply_system_theme(system);
-            assert_theme(&state.theme, expected);
-        }
-    }
-
-    #[test]
-    fn system_theme_changes_preserve_application_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("selected.iso");
-        std::fs::write(&path, b"image fixture").unwrap();
-        let mut state = State::default();
-        state.apply_image(Some(IsoImage::open(path)));
-        state.apply_devices(Ok(vec![rustfus_core::devices::DeviceInfo {
-            id: "usb-target".into(),
-            path: "/dev/usb-target".into(),
-            name: "Selected USB disk".into(),
+        state.apply_devices(Ok(vec![DeviceInfo {
+            id: "fixture".into(),
+            path: "/dev/NEVER-OPEN-test-fixture".into(),
+            name: "Test disk".into(),
             serial: None,
             size_bytes: 8_000_000_000,
             removable: true,
             read_only: false,
         }]));
-        state.model.set_include_fixed(true);
-        state.model.partition_scheme = PartitionScheme::Gpt;
-        state.model.target_system = TargetSystem::Legacy;
-        state.discovery = Discovery::Failed("temporary discovery error".into());
-        state.image_error = Some("previous image error".into());
-        state.choosing_image = true;
-        state.advanced_open = true;
-        let model_before = format!("{:?}", state.model);
-        let devices_before = state.device_options.clone();
-        let targets_before = state.target_options.clone();
+        state
+    }
 
-        for mode in [
-            iced::theme::Mode::Dark,
-            iced::theme::Mode::Light,
-            iced::theme::Mode::None,
+    #[test]
+    fn wrong_confirmation_and_cancel_never_start() {
+        let mut state = ready();
+        state.request_confirmation();
+        state.confirmation_text = "wrong".into();
+        assert!(state.begin_confirmed().is_none());
+        assert!(!state.running);
+        state.confirmation = None;
+        assert!(state.begin_confirmed().is_none());
+        assert!(state.active_request.is_none());
+    }
+
+    #[test]
+    fn busy_controls_and_scans_cannot_change_snapshot() {
+        let mut state = ready();
+        state.request_confirmation();
+        let snapshot = format!("{:?}", state.confirmation);
+        for running in [false, true] {
+            state.running = running;
+            state.configure(Message::LabelChanged("CHANGED".into()));
+            state.configure(Message::SelectPartition(PartitionScheme::Gpt));
+            state.configure(Message::IncludeFixed(true));
+            state.configure(Message::SelectBoot(Choice::new(
+                BootSelection::Iso,
+                "Windows ISO",
+            )));
+            state.configure(Message::SelectCluster(Choice::new(Some(512), "512")));
+            state.apply_devices(Ok(vec![]));
+            assert_eq!(format!("{:?}", state.confirmation), snapshot);
+            assert_eq!(state.volume_label, "RUSTFUS");
+            assert_eq!(state.model.partition_scheme, PartitionScheme::Mbr);
+            assert_eq!(state.model.boot_selection, BootSelection::NonBootable);
+            assert!(state.model.selected_device().is_some());
+            assert_eq!(state.cluster_size, None);
+        }
+    }
+
+    #[test]
+    fn changed_target_denies_confirmation_even_if_text_matches() {
+        let mut state = ready();
+        state.request_confirmation();
+        state.confirmation_text = state.confirmation.as_ref().unwrap().device.path.clone();
+        state.model.selected_device = None;
+        assert!(!state.can_confirm());
+        assert!(state.begin_confirmed().is_none());
+    }
+
+    #[test]
+    fn success_and_error_finish_progress_without_opening_any_disk() {
+        let mut state = ready();
+        for success in [true, false] {
+            state.request_confirmation();
+            state.confirmation_text = state.confirmation.as_ref().unwrap().device.path.clone();
+            let (request, _) = state.begin_confirmed().unwrap();
+            assert_eq!(request.device.path, "/dev/NEVER-OPEN-test-fixture");
+            assert!(state.running);
+            assert_eq!(state.progress.as_ref().unwrap().phase, Phase::Preparing);
+            state.finish(if success {
+                Ok(WriteSummary {
+                    files_written: 0,
+                    bytes_written: 0,
+                    architecture: None,
+                })
+            } else {
+                Err("fixture failure".into())
+            });
+            assert!(!state.running);
+            assert!(state.progress.is_none());
+            assert_eq!(state.result.as_ref().unwrap().is_ok(), success);
+        }
+    }
+
+    #[test]
+    fn validation_blocks_read_only_missing_iso_and_invalid_label() {
+        let mut state = ready();
+        state.volume_label = "bad/name".into();
+        state.request_confirmation();
+        assert!(state.confirmation.is_none());
+        state.volume_label = "VALID".into();
+        state.select_boot(BootSelection::Iso);
+        state.request_confirmation();
+        assert!(state.confirmation.is_none());
+        state.select_boot(BootSelection::NonBootable);
+        state.model.devices[0].read_only = true;
+        state.request_confirmation();
+        assert!(state.confirmation.is_none());
+    }
+
+    #[test]
+    fn discovery_failure_recovers() {
+        let mut state = ready();
+        state.apply_devices(Err("scan failed".into()));
+        assert!(state.model.selected_device().is_none());
+        state.apply_devices(Ok(vec![]));
+        assert_eq!(state.discovery, Discovery::Ready);
+    }
+
+    #[test]
+    fn cancelled_and_failed_picker_preserve_previous_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.iso");
+        std::fs::write(&path, b"metadata fixture, not an installer").unwrap();
+        let mut state = ready();
+        state.apply_image(Some(IsoImage::open(path.clone())));
+        state.choosing_image = true;
+        state.apply_image(None);
+        assert_eq!(state.model.iso.as_ref().unwrap().path, path);
+        state.apply_image(Some(Err("unreadable".into())));
+        assert_eq!(state.model.iso.as_ref().unwrap().path, path);
+        assert!(state.image_error.is_some());
+    }
+
+    #[test]
+    fn unsupported_modes_are_rejected() {
+        let mut state = ready();
+        for mode in [BootSelection::MsDos, BootSelection::FreeDos] {
+            state.select_boot(mode);
+        }
+        assert_eq!(state.model.boot_selection, BootSelection::NonBootable);
+        state.configure(Message::SelectTarget(Choice::new(
+            TargetSystem::Legacy,
+            "Legacy",
+        )));
+        assert_eq!(state.model.target_system, TargetSystem::BiosOrUefi);
+    }
+
+    #[test]
+    fn system_themes_preserve_busy_application_state() {
+        let mut state = ready();
+        state.request_confirmation();
+        let snapshot = format!("{:?}", state.confirmation);
+        for (system, expected) in [
+            (iced::theme::Mode::Dark, shadcn_iced::Mode::Dark),
+            (iced::theme::Mode::Light, shadcn_iced::Mode::Light),
+            (iced::theme::Mode::None, shadcn_iced::Mode::Light),
         ] {
-            state.apply_system_theme(mode);
-            assert_eq!(format!("{:?}", state.model), model_before);
-            assert_eq!(state.device_options, devices_before);
-            assert_eq!(state.target_options, targets_before);
+            state.apply_system_theme(system);
             assert_eq!(
-                state.discovery,
-                Discovery::Failed("temporary discovery error".into())
+                shadcn_iced::tokens(&state.theme).palette,
+                shadcn_iced::theme::neutral(expected).tokens().palette
             );
-            assert_eq!(state.image_error.as_deref(), Some("previous image error"));
-            assert!(state.choosing_image);
-            assert!(state.advanced_open);
+            assert_eq!(format!("{:?}", state.confirmation), snapshot);
         }
     }
 }

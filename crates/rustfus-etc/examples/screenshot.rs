@@ -77,6 +77,6 @@ fn main() -> iced::Result {
         .theme(|preview: &Preview| preview.0.theme())
         .shadcn_iced()
         .default_font(font)
-        .window_size((680.0, 820.0))
+        .window_size((620.0, 640.0))
         .run()
 }

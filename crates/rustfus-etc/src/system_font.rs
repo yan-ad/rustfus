@@ -215,5 +215,14 @@ mod tests {
             db.face(id).expect("resolved face").post_script_name,
             native.postscript_name(),
         );
+        let loaded = system
+            .raw()
+            .get_font(id, fontdb::Weight::NORMAL)
+            .expect("native face must load for shaping");
+        assert_eq!(loaded.optical_size(), Some(17.0));
+        assert_eq!(
+            iced::widget::text::Shaping::default(),
+            iced::widget::text::Shaping::Advanced
+        );
     }
 }
