@@ -37,7 +37,7 @@ pub enum TargetSystem {
     Legacy,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IsoImage {
     pub path: PathBuf,
     pub name: String,

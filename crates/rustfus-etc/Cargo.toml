@@ -1,0 +1,34 @@
+[package]
+name = "rustfus-etc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RustFus native desktop application built with iced and shadcn-iced"
+default-run = "rustfus"
+
+[[bin]]
+name = "rustfus"
+path = "src/main.rs"
+
+[dependencies]
+rustfus-core.workspace = true
+iced.workspace = true
+iced_graphics = "0.14"
+shadcn-iced.workspace = true
+rfd.workspace = true
+tokio = { version = "1", features = ["rt"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-text = "22"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fontconfig = { version = "0.10", features = ["dlopen"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

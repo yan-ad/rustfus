@@ -1,5 +1,5 @@
 fn main() {
-    match rustfus::devices::enumerate_usb_devices() {
+    match rustfus_core::devices::enumerate_usb_devices() {
         Ok(devices) => {
             if devices.is_empty() {
                 println!("No USB physical disks detected.");

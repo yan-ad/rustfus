@@ -51,6 +51,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             libdbus-1-dev \
             libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
             libgbm-dev \
             libgl1-mesa-dev \
             libudev-dev \
@@ -64,17 +66,17 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Check formatting
+      - name: Check workspace formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy with warnings denied
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets
 
-      - name: Run tests
-        run: cargo test --all-targets
+      - name: Run workspace Clippy with warnings denied
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build -p rustfus-etc --bin rustfus --release --locked
 
       - name: Collect binary
         shell: bash
@@ -82,7 +84,7 @@ jobs:
           mkdir -p artifacts
           cp "target/release/${{ matrix.binary }}" "artifacts/${{ matrix.binary }}"
 
-      - name: Upload portable binary
+      - name: Upload raw binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -96,33 +98,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install Linux native dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            libdbus-1-dev \
-            libegl1-mesa-dev \
-            libgbm-dev \
-            libgl1-mesa-dev \
-            libudev-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            pkg-config \
-            xorg-dev
-
       - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@1.92.0
         with:
-          components: rustfmt, clippy
+          components: rustfmt
 
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+      - name: Check core formatting
+        run: cargo fmt -p rustfus-core -- --check
 
-      - name: cargo clippy --all-targets -- -D warnings
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Check core targets
+        run: cargo check -p rustfus-core --all-targets
 
-      - name: cargo test --all-targets
-        run: cargo test --all-targets
-
-      - name: Core-only tests without GUI dependencies
-        run: cargo test --no-default-features
+      - name: Run core tests without GUI dependencies
+        run: cargo test -p rustfus-core
