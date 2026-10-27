@@ -1,0 +1,11 @@
+# Rust build output
+target/
+
+# macOS metadata
+.DS_Store
+
+# Generated screenshots and local artifacts
+screenshots/
+artifacts/
+screenshot*.png
+rustfus-screenshot*.png

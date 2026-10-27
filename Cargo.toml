@@ -1,0 +1,36 @@
+[package]
+name = "rustfus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A native, non-destructive preview of a cross-platform USB media tool"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd"]
+screenshot = ["gui", "eframe/__screenshot", "eframe/glow"]
+
+[dependencies]
+eframe = { version = "0.35", optional = true, default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11"] }
+rfd = { version = "0.17", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+io-kit-sys = "0.5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rustfus"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
